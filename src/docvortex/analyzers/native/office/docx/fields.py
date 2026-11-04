@@ -8,6 +8,7 @@ from docx.text.hyperlink import Hyperlink
 from docx.text.paragraph import Paragraph
 from docx.text.run import Run
 from loguru import logger
+from lxml import etree
 from .....schema import BlockType
 from .formatting_types import Formatting
 
@@ -338,6 +339,101 @@ class _DocxFields:
             paragraph_elements.append((group_text, previous_format, None))
 
         return self._normalize_hyperlink_group_boundaries(paragraph_elements)
+
+    def _paragraph_page_break_events(
+        self,
+        element: BaseOxmlElement,
+        paragraph: Paragraph,
+    ) -> tuple[bool, tuple[int, ...]]:
+        """收集单个段落的分页事件并返回 ``(page_break_before, 段内分页偏移)``。
+
+        OOXML 有三级段落内分页信号：
+
+        - ``w:pPr/w:pageBreakBefore``（含样式继承）：段落排到新一页；
+        - ``w:br w:type="page"``：段内显式分页符（Ctrl+Enter）；
+        - ``w:lastRenderedPageBreak``：Word 最后一次渲染记录的分页位置。
+
+        偏移量与 `_get_paragraph_elements` 的可见字符流对齐（按文档顺序拼接的 run
+        文本，未剥首尾空白）：显式/渲染分页符落在第 N 个可见字符之后的位置为 N。
+        普通 run 的隐藏文本会进入元素流（超链接内例外，见 `_flatten_paragraph_elements`），
+        偏移统计按同一可见性规则累计。
+        """
+        w_ns = _DocxConstants._BLIP_NAMESPACES["w"]
+        before = self._has_page_break_before(element, paragraph)
+        offsets: list[int] = []
+        emitted = 0
+        for content in self._iter_paragraph_inner_content(paragraph):
+            if isinstance(content, Run):
+                runs: tuple[Run, ...] = (content,)
+            elif isinstance(content, Hyperlink):
+                runs = tuple(content.runs)
+            else:
+                continue
+            for run in runs:
+                # 超链接内隐藏 run 不进入元素流，不计字符也不计分页事件。
+                if isinstance(content, Hyperlink) and self._is_hidden_run(run):
+                    continue
+                for child in run._element:
+                    tag = getattr(child, "tag", None)
+                    if not isinstance(tag, str):
+                        continue
+                    name = etree.QName(tag).localname
+                    if name == "t":
+                        emitted += len(child.text or "")
+                    elif name in ("tab", "cr"):
+                        emitted += 1
+                    elif name == "br":
+                        if child.get(f"{{{w_ns}}}type") == "page":
+                            offsets.append(emitted)
+                        else:
+                            emitted += 1
+                    elif name == "lastRenderedPageBreak":
+                        offsets.append(emitted)
+        return before, tuple(dict.fromkeys(offsets))
+
+    @staticmethod
+    def _on_off_flag(on: BaseOxmlElement) -> bool:
+        """解析 OOXML ST_OnOff 布尔元素：无 ``w:val`` 视为开启，``0/false/none`` 视为关闭。
+
+        WPS 等工具会为大量段落显式写出关闭态 ``<w:pageBreakBefore w:val="0"/>``，
+        只判断元素存在会把"关闭态"误判为段首分页。
+        """
+        w_ns = _DocxConstants._BLIP_NAMESPACES["w"]
+        val = (on.get(f"{{{w_ns}}}val") or "").strip().lower()
+        return val not in ("0", "false", "none")
+
+    def _has_page_break_before(self, element: BaseOxmlElement, paragraph: Paragraph) -> bool:
+        """判断段落是否段首分页，即 ``pPr/w:pageBreakBefore`` 是否处于开启态。
+
+        先看段落直接设置，关闭态（``w:val="0"``）不回落到样式链（显式关闭优先）；
+        未直接设置时再查样式继承链。样式链可能 basedOn 自引用或环形引用，
+        按已访问样式去环（与 ``_resolve_style_chain_bool`` 一致）。
+        """
+        w_ns = _DocxConstants._BLIP_NAMESPACES["w"]
+        p_pr = element.find(f"{{{w_ns}}}pPr")
+        direct = p_pr.find(f"{{{w_ns}}}pageBreakBefore") if p_pr is not None else None
+        if direct is not None:
+            return self._on_off_flag(direct)
+        style = self._get_paragraph_style(paragraph)
+        visited: set = set()
+        while style is not None:
+            style_element = getattr(style, "_element", None)
+            style_marker = (
+                id(style_element) if style_element is not None else id(style),
+                getattr(style, "type", None),
+                getattr(style, "style_id", None),
+            )
+            if style_marker in visited:
+                break
+            visited.add(style_marker)
+            if style_element is not None:
+                style_p_pr = style_element.find(f"{{{w_ns}}}pPr")
+                if style_p_pr is not None:
+                    style_pbb = style_p_pr.find(f"{{{w_ns}}}pageBreakBefore")
+                    if style_pbb is not None:
+                        return self._on_off_flag(style_pbb)
+            style = getattr(style, "based_on", None)
+        return False
 
     def _iter_paragraph_inner_content(
         self,

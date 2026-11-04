@@ -18,6 +18,7 @@ from .....content.spans import (
     append_text_span,
     extend_inline_spans,
     inline_span_plain_text,
+    slice_span_dicts,
     text_spans,
 )
 
@@ -62,6 +63,10 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
         self.index_block_stack: list = []  # 目录索引块堆栈
         self.pre_index_ilevel: int = -1  # 上一个目录项的缩进等级
         self.plain_toc_base_level: Optional[int] = None  # 普通目录段落的起始层级
+        self._ppb_before: bool = False  # 当前段落段首需分页（pageBreakBefore 或偏移 0 的分页）
+        self._ppb_offsets: tuple[int, ...] = ()  # 当前段落剩余段内分页位置（可见字符偏移，均 > 0）
+        self._ppb_before_applied: bool = True  # 段首分页是否已消费
+        self._ppb_done: bool = True  # 段内分页是否已消费（同一段落只切一次，兜住旧双产路径）
         self.heading_list_numids: set = set()  # 用作章节标题的列表numId集合
         self.processed_textbox_elements: list = []
         self.toc_anchor_set: set[str] = set()  # TOC 超链接目标锚点集合
@@ -112,6 +117,10 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
         return normalize_docx_package(file_bytes)
 
     def _start_new_page(self) -> None:
+        # 连续分页符（如显式分页符后又紧跟段首分页标志/分节符）折叠到当前空白页上：
+        # 同一文档边界处的多个分页事件不产生额外空页，与 Word 对连续分页符的渲染一致。
+        if not self.cur_page:
+            return
         self.cur_page = []
         self.pages.append(self.cur_page)
 
@@ -167,6 +176,10 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
             self.pages.append(self.cur_page)
             self._walk_linear(self.docx_obj.element.body)
             self._add_header_footer(self.docx_obj)
+            # 文档末尾的分页符/分节符可能留下空尾页，按各格式既有约定剥除，
+            # 避免公开 API 页数虚高（与 odf converters 的尾部收敛一致）。
+            while len(self.pages) > 1 and not self.pages[-1]:
+                self.pages.pop()
         finally:
             self._close_mammoth_fallback_context()
             self._fallback_docx_bytes = None
@@ -329,6 +342,15 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
                 # 标记本节结束，处理完文本之后再分节
                 is_section_end = True
         paragraph = Paragraph(element, self.docx_obj)
+        # 段落分页事件在任何产出之前收集：偏移 0 的分页与 pageBreakBefore 同义，段首生效。
+        before, offsets = self._paragraph_page_break_events(element, paragraph)
+        if offsets and offsets[0] == 0:
+            before = True
+            offsets = offsets[1:]
+        self._ppb_before = before
+        self._ppb_offsets = offsets
+        self._ppb_before_applied = not before
+        self._ppb_done = not offsets
         paragraph_elements = self._get_paragraph_elements(paragraph)
         paragraph_text = self._get_paragraph_text(paragraph)
         paragraph_anchor = self._extract_paragraph_bookmark(element)
@@ -339,6 +361,7 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
         )
 
         if text is None:
+            self._finish_page_break_events()
             return None
         text = text.strip()
 
@@ -353,6 +376,8 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
             if self.pre_num_id != -1:
                 self._close_active_list()
             # 普通 TOC 段落被转换为 INDEX 后，也要保留段落末尾分节分页语义。
+            # TOC 块已在内部产出，这里按粗粒度收尾耗尽段落分页事件（块不跨页拆）。
+            self._finish_page_break_events()
             if is_section_end:
                 self._start_new_page()
             return None
@@ -388,7 +413,7 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
                     }
                     if paragraph_anchor:
                         title_block["anchor"] = paragraph_anchor
-                    self.cur_page.append(title_block)
+                    self._append_with_page_breaks(title_block)
             else:
                 self._add_list_item(
                     numid=numid,
@@ -398,7 +423,8 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
                     text=text,
                     equations=equations,
                 )
-            # 列表项已处理，返回
+            # 列表项已处理，返回；列表叶子不跨页拆，残留分页事件按粗粒度收尾。
+            self._finish_page_break_events()
             return None
         elif (  # 列表结束处理
             numid is None and self.pre_num_id != -1 and p_style_id not in ["Title", "Heading"]
@@ -417,7 +443,7 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
                 }
                 if paragraph_anchor:
                     title_block["anchor"] = paragraph_anchor
-                self.cur_page.append(title_block)
+                self._append_with_page_breaks(title_block)
 
         elif "Heading" in p_style_id:
             is_numbered_style = numid is not None and ilevel is not None and self._is_numbered_list(numid, ilevel)
@@ -432,7 +458,7 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
                 }
                 if paragraph_anchor:
                     h_block["anchor"] = paragraph_anchor
-                self.cur_page.append(h_block)
+                self._append_with_page_breaks(h_block)
 
         elif equations:
             equation_values = [value for kind, value in equations if kind == "equation"]
@@ -442,7 +468,7 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
                     "type": BlockType.EQUATION,
                     "content": equation_values[0] if len(equation_values) == 1 else "\n".join(equation_values),
                 }
-                self.cur_page.append(eq_block)
+                self._append_with_page_breaks(eq_block)
             else:
                 # 包含行内公式的文本块，同时支持超链接
                 content_text = self._build_text_with_equations_and_hyperlinks(paragraph_elements, text, equations)
@@ -454,7 +480,7 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
                     }
                     if paragraph_anchor:
                         text_with_inline_eq_block["anchor"] = paragraph_anchor
-                    self.cur_page.append(text_with_inline_eq_block)
+                    self._append_with_page_breaks(text_with_inline_eq_block)
         elif p_style_id in [
             "Paragraph",
             "Normal",
@@ -475,7 +501,7 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
                 }
                 if paragraph_anchor:
                     text_block["anchor"] = paragraph_anchor
-                self.cur_page.append(text_block)
+                self._append_with_page_breaks(text_block)
         # 判断是否是 Caption
         elif self._is_caption(element):
             # 构建包含公式和超链接的文本
@@ -487,7 +513,7 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
                 }
                 if paragraph_anchor:
                     caption_block["anchor"] = paragraph_anchor
-                self.cur_page.append(caption_block)
+                self._append_with_page_breaks(caption_block)
         else:
             # 文本样式名称不仅有默认值，还可能有用户自定义值
             # 因此我们将所有其他标签视为纯文本
@@ -501,10 +527,87 @@ class DocxConverter(_DocxConstants, _DocxResources, _DocxStyles, _DocxNumbering,
                 }
                 if paragraph_anchor:
                     text_block["anchor"] = paragraph_anchor
-                self.cur_page.append(text_block)
+                self._append_with_page_breaks(text_block)
 
+        # 主链路未产出任何块（如仅含分页符的空段落）时，耗尽未消费的分页事件。
+        self._finish_page_break_events()
         if is_section_end:
             self._start_new_page()
+
+    def _finish_page_break_events(self) -> None:
+        """耗尽当前段落尚未消费的分页事件（早期返回 / 无产出路径）。
+
+        段首分页起新一页；段内分页粗粒度折算为逐次换页（块内容不拆，
+        段落后半内容归属上一页，页数保持正确）。主链路的块产出走
+        ``_append_with_page_breaks``，事件已在产出时消费，此处为 no-op。
+        """
+        if self._ppb_before and not self._ppb_before_applied:
+            self._start_new_page()
+            self._ppb_before_applied = True
+        for _ in self._ppb_offsets:
+            self._start_new_page()
+        self._ppb_offsets = ()
+        self._ppb_before_applied = True
+        self._ppb_done = True
+
+    def _append_with_page_breaks(self, block: dict[str, Any]) -> None:
+        """产出当前段落的块；段落内分页时按偏移在页间精确切分 Span 内容。
+
+        首个块消费全部段落分页：段首分页（pageBreakBefore 或偏移 0）起新页后
+        按段内偏移切分整个块；同一后续块（旧版孤立段落的双重产出路径）不再
+        重复切分。内容非 Span 列表或切分退化（偏移都塌在同一边界）时回退
+        为"整块产出 + 每个偏移换一页"。
+        """
+        if self._ppb_before and not self._ppb_before_applied:
+            self._start_new_page()
+            self._ppb_before_applied = True
+        offsets = self._ppb_offsets
+        if offsets and not self._ppb_done:
+            self._ppb_done = True
+            self._ppb_offsets = ()  # 事件在此消费完毕（成功切分或下方回退路径），收尾不再重放
+            segments = self._cut_page_break_segments(block, offsets)
+            if segments is not None:
+                first = True
+                for segment in segments:
+                    if not first:
+                        self._start_new_page()
+                    first = False
+                    if not segment:
+                        continue
+                    part = dict(block)
+                    part["content"] = segment
+                    self.cur_page.append(part)
+                return
+        self.cur_page.append(block)
+        for _ in offsets:
+            self._start_new_page()
+
+    def _cut_page_break_segments(self, block: dict[str, Any], offsets: tuple[int, ...]) -> list[list[dict[str, Any]]] | None:
+        """按段内分页偏移切分块的 Span 内容，无法精确对齐时返回 None 由调用方回退。
+
+        偏移与 ``_append_with_page_breaks`` 传递的原文档事件一致（事件已在消费前
+        从实例状态清空，不能再从 self 读取）。偏移坐标系为未剥首尾空白的段落可见
+        字符流（见 `_paragraph_page_break_events`）；普通文本块产出前会额外剥掉
+        首尾空白，存在至多数个空白的近似偏差。
+        """
+        content = block.get("content")
+        if not isinstance(content, list) or not content or not all(isinstance(span, dict) for span in content):
+            return None
+        visible_total = len(inline_span_plain_text(content))
+        clamped = [min(max(offset, 0), visible_total) for offset in offsets]
+        if not any(0 < offset < visible_total for offset in clamped):
+            return None  # 全部落在段首/段尾塌缩圈外，换页次数由回退路径保证
+        if len(set(clamped)) < len(clamped):
+            return None  # 多个偏移塌到同一点，按次数折算更保守
+        segments: list[list[dict[str, Any]]] = []
+        start = 0
+        for offset in clamped:
+            segments.append(slice_span_dicts(content, start, offset))
+            start = offset
+        segments.append(slice_span_dicts(content, start, None))
+        if any(not segment for segment in segments[1:-1]):
+            return None
+        return segments
 
     def _process_header_footer_paragraph(self, paragraph: Paragraph) -> list[dict[str, Any]]:
         """
