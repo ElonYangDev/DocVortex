@@ -556,7 +556,11 @@ class _DocxTables:
         return convert_document_element_to_html(result.value[0], **conversion_options).value
 
     def _handle_tables(self, element: BaseOxmlElement) -> None:
-        """按正文顺序输出表格；预匹配失败时使用完整 DOCX 上下文回退。"""
+        """按正文顺序输出表格；预匹配失败时使用完整 DOCX 上下文回退。
+
+        单元格内的 w:lastRenderedPageBreak 把该行标记为新页起点：表格按行
+        边界切分为连续行块并逐块换页产出，延续的分页信号不产生空页。
+        """
         table_index = self._mammoth_table_idx
         self._mammoth_table_idx += 1
         html = self._mammoth_tables_html[table_index] if table_index < len(self._mammoth_tables_html) else None
@@ -575,7 +579,50 @@ class _DocxTables:
                 )
         except Exception as exc:
             raise RuntimeError(f"table #{table_index + 1}, {stage}: {exc}") from exc
-        self.cur_page.append({"type": BlockType.TABLE, "content": self._normalize_table_links(html)})
+        chunks, first_row_break = self._split_table_at_lrbp_rows(html, element)
+        for part_index, part_html in enumerate(chunks):
+            if part_index == 0 and first_row_break:
+                # 表格首行本身即渲染分页起点（与正文段落偏移 0 分页同语义），
+                # _start_new_page 对相邻同边界分页的折叠由此天然兜住。
+                self._start_new_page()
+            elif part_index > 0:
+                self._start_new_page()
+            self.cur_page.append({"type": BlockType.TABLE, "content": self._normalize_table_links(part_html)})
+
+    def _split_table_at_lrbp_rows(self, html: str, xml_table: BaseOxmlElement) -> tuple[list[str], bool]:
+        """按行内 w:lastRenderedPageBreak 把表格 HTML 切为连续行块。
+
+        返回 (行块 HTML 列表, 首行是否为分页起点)。每个含渲染分页标记的行
+        最多计一个换页（行级保守近似，跨页续排行与行内分页共用同一切分点），
+        各块为可独立渲染的 <table>；mammoth 行与 XML 行无法一一对齐时
+        退化为整块输出，保证不丢内容、不产空页。
+        """
+        w_ns = _DocxConstants._BLIP_NAMESPACES["w"]
+        xml_rows = xml_table.findall(f"{{{w_ns}}}tr")
+        boundary_rows = [
+            index for index, row in enumerate(xml_rows) if row.find(f".//{{{w_ns}}}lastRenderedPageBreak") is not None
+        ]
+        if not boundary_rows:
+            return [html], False
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html, "html.parser")
+        table = soup.find("table")
+        html_rows = table.find_all("tr") if table is not None else []
+        if table is None or len(xml_rows) < 2 or len(html_rows) != len(xml_rows):
+            return [html], False
+        first_row_break = boundary_rows[0] == 0
+        cuts = sorted(boundary_rows) + [len(xml_rows)]
+        chunks: list[str] = []
+        start = 0
+        for cut in cuts:
+            rows = html_rows[start:cut]
+            if rows:
+                chunks.append(f"<table>{''.join(str(row) for row in rows)}</table>")
+            start = cut
+        if not first_row_break and len(chunks) <= 1:
+            return [html], False
+        return chunks, first_row_break
 
     @staticmethod
     def _normalize_table_links(markup: str) -> str:
