@@ -293,22 +293,35 @@ def test_fallback_converter_reuse_and_error_release(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.parametrize(
-    ("path", "expected_count", "expected_rows"),
+    ("path", "expected_preparsed", "expected_blocks", "expected_rows"),
     [
-        ("tests/fixtures/docx/issue9-merged-cells.docx", 1, 37),
-        ("demo/ms_office_docs/docx_01.docx", 8, None),
+        ("tests/fixtures/docx/issue9-merged-cells.docx", 1, 1, 37),
+        ("demo/ms_office_docs/docx_01.docx", 8, 12, None),
     ],
 )
-def test_existing_docx_samples_keep_tables(path: str, expected_count: int, expected_rows: int | None) -> None:
+def test_existing_docx_samples_keep_tables(
+    path: str, expected_preparsed: int, expected_blocks: int, expected_rows: int | None
+) -> None:
     """回放真实 DOCX 样本，检查表格数量及 issue #9 的完整行数。"""
     file_bytes = (PROJECT_ROOT / path).read_bytes()
     converter = DocxConverter()
     preparsed = converter._preparse_tables_with_mammoth(file_bytes)
-    assert len(preparsed) == expected_count
+    assert len(preparsed) == expected_preparsed
     assert all(html is not None for html in preparsed)
     converter.convert(BytesIO(file_bytes))
     html_tables = _table_html(converter)
-    assert len(html_tables) == expected_count
-    assert html_tables == [converter._normalize_table_colspans(html) for html in preparsed]
+    assert len(html_tables) == expected_blocks
+    if expected_blocks == expected_preparsed:
+        assert html_tables == [converter._normalize_table_colspans(html) for html in preparsed]
+    else:
+
+        def rows(markup: str) -> list[str]:
+            """按出现顺序提取表格全部行（含嵌套），用于整行保留比对。"""
+
+            return [str(tr) for tr in BeautifulSoup(markup, "html.parser").find_all("tr")]
+
+        source = [row for html in preparsed for row in rows(converter._normalize_table_colspans(html))]
+        output = [row for block in html_tables for row in rows(block)]
+        assert output == source
     if expected_rows is not None:
         assert len(BeautifulSoup(html_tables[0], "html.parser").find_all("tr")) == expected_rows

@@ -45,7 +45,7 @@ _OFFICE_SAMPLE_DIR = _PROJECT_ROOT / "demo" / "ms_office_docs"
 @pytest.mark.parametrize(
     ("suffix", "model_class", "convert_binary", "expected_pages"),
     [
-        ("docx", DocxModel, docx_main.convert_binary, 3),
+        ("docx", DocxModel, docx_main.convert_binary, 13),
         ("pptx", PptxModel, pptx_main.convert_binary, 6),
         ("xlsx", XlsxModel, xlsx_main.convert_binary, 3),
     ],

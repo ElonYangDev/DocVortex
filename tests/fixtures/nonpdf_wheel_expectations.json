@@ -9,7 +9,7 @@
       "file_suffix": "doc",
       "source_context": null,
       "sha256": "6aae60b01f0e020c59d2299f217dbd5904df08182a31384db40953937f322fd1",
-      "page_count": 3,
+      "page_count": 4,
       "required_text": [
         "MinerU supports DOCX document parsing now",
         "github主页"
@@ -21,7 +21,7 @@
       "file_suffix": "docx",
       "source_context": null,
       "sha256": "86393df4b91412b946c7331e27e762440889b916a0d2ec9331700913f06a7a1b",
-      "page_count": 3,
+      "page_count": 13,
       "required_text": [
         "MinerU supports DOCX document parsing now",
         "github主页"

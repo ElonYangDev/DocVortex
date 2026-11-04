@@ -27,13 +27,13 @@ def test_real_doc_recovers_sections_structure_and_sidecars(tmp_path: Path) -> No
     middle, model = _analyze_sample("doc")
     counts = Counter(block.get("type") for page in model.pages for block in page)
 
-    assert len(model.pages) == len(middle.pages) == 3
+    assert len(model.pages) == len(middle.pages) == 4
     assert counts[BlockType.DOC_TITLE] == 1
     assert counts[BlockType.PARAGRAPH_TITLE] == 37
     assert counts[BlockType.INDEX] == 1
     assert counts[BlockType.LIST] == 5
     assert counts[BlockType.TABLE] == 8
-    assert counts[BlockType.HEADER] == 4
+    assert counts[BlockType.HEADER] == 5
     assert counts[BlockType.FOOTER] == 1
     assert counts[BlockType.IMAGE] >= 44
     assert counts[BlockType.CHART] == 1

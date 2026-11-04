@@ -45,7 +45,7 @@ def test_doc_image_store_distinguishes_render_size_without_double_accounting() -
 
 
 def test_doc_model_preserves_empty_sections_and_ignores_page_breaks() -> None:
-    """验证 section 是唯一分页来源，空 section 保留且分页符不额外切页。"""
+    """验证 section 是唯一分页来源，空 section 保留，且 section 起始处/连续的分页符不产生额外空页。"""
 
     text = "\fFirst\rSecond\r"
     first_end = utf16_cp("\fFirst\r")
