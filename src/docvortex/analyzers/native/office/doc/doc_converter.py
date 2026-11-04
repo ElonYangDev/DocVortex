@@ -523,9 +523,16 @@ class DocConverter:
         return result
 
     @classmethod
-    def _section_page(cls, section: DocSection) -> list[dict[str, Any]]:
-        """转换一个 section，并将页面辅助文本稳定追加到末尾。"""
+    def _section_pages(cls, section: DocSection) -> list[list[dict[str, Any]]]:
+        """转换一个 section 为一份或多份物理页，并把页面辅助文本追加到末尾各页。
 
+        分页来源：每个 section 至少一页（沿用既有语义），段落的显式分页符
+        （``page_break_after``，Word 内的 Ctrl+Enter）在其后追加新一页。
+        二进制 DOC 不保存 Word 的流式渲染分页位置，无法还原自动换页，
+        渲染分页仍由 section 主导——这是格式本身的信息缺口。
+        """
+
+        out: list[list[dict[str, Any]]] = []
         page: list[dict[str, Any]] = []
         list_stack: list[dict[str, Any]] = []
         list_identity: int | None = None
@@ -556,19 +563,33 @@ class DocConverter:
                     if image is not None:
                         page.append(image)
                 continue
-            list_stack.clear()
-            list_identity = None
-            page.extend(cls._element_blocks(element))
-        page.extend({"type": BlockType.HEADER, "content": content} for content in cls._auxiliary_contents(section.headers))
-        page.extend({"type": BlockType.FOOTER, "content": content} for content in cls._auxiliary_contents(section.footers))
-        page.extend(
-            {"type": BlockType.PAGE_FOOTNOTE, "content": content} for content in cls._auxiliary_contents(section.footnotes)
-        )
-        return page
+            blocks = cls._element_blocks(element)
+            page.extend(blocks)
+            if isinstance(element, DocParagraph) and element.page_break_after:
+                # 连续分页符（段前无内容）折叠到当前页：不产生额外空页，
+                # 与 DOCX 侧 `_start_new_page` 对连续分页事件的折叠语义一致。
+                if page:
+                    out.append(page)
+                    page = []
+                list_stack.clear()
+                list_identity = None
+                index_stack.clear()
+        if page or not out:
+            out.append(page)
+        headers = cls._auxiliary_contents(section.headers)
+        footers = cls._auxiliary_contents(section.footers)
+        footnotes = cls._auxiliary_contents(section.footnotes)
+        for section_page in out:
+            section_page.extend({"type": BlockType.HEADER, "content": content} for content in headers)
+            section_page.extend({"type": BlockType.FOOTER, "content": content} for content in footers)
+            section_page.extend({"type": BlockType.PAGE_FOOTNOTE, "content": content} for content in footnotes)
+        return out
 
     @classmethod
     def _document_pages(cls, document: DocDocument) -> list[list[dict[str, Any]]]:
         """转换整份 DOC，并至少保留一个空 section page。"""
 
-        pages = [cls._section_page(section) for section in document.sections]
+        pages: list[list[dict[str, Any]]] = []
+        for section in document.sections:
+            pages.extend(cls._section_pages(section))
         return pages or [[]]

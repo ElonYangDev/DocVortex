@@ -84,6 +84,7 @@ class DocParagraph:
     cell_mark: bool = False
     row_mark: bool = False
     table_format: DocTableFormat | None = None
+    page_break_after: bool = False
 
 
 @dataclass(frozen=True, slots=True)

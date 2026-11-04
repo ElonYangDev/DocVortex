@@ -252,7 +252,9 @@ class _Assembler:
         row_mark = bool(pap.row_mark) or bool(pap.inner_row)
         in_table = bool(pap.in_table) or cell_mark or row_mark
         visible = any(run.text for run in runs) or bool(images)
-        if not visible and not in_table:
+        # 0x0C 段落终止符 = 显式分页符：即便段落本身无可见内容也要保留，让 Converter 得以在后续语义元素前换页
+        page_break_after = terminator == "\x0c"
+        if not visible and not in_table and not page_break_after:
             return None
         list_info = None
         if pap.ilfo is not None:
@@ -279,6 +281,7 @@ class _Assembler:
             cell_mark=cell_mark,
             row_mark=row_mark,
             table_format=pap.table,
+            page_break_after=page_break_after,
         )
 
     def paragraphs(
